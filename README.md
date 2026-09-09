@@ -121,6 +121,29 @@ This extension runs as the current user with no elevated privileges:
 
 Removing the plugin removes every byte it ever wrote.
 
+### `input` group membership is not removed by `omarchy plugin remove`
+
+`/dev/input/event*` is owned by the `input` group so the kernel can hand
+keystrokes to anything in that group. Membership in `input` is broader
+than this plugin: every desktop environment that intercepts input
+events — Wayland compositors, screen recorders, macro tools, gesture
+daemons — relies on it.
+
+`omarchy plugin remove ozz1ee.keyboard-cleaner` deletes the plugin
+directory and clears its enablement, but it does **not** touch group
+membership. After removing the plugin your account stays in the
+`input` group, with the same level of access to every keystroke and
+pointer event on the system. To drop that access too:
+
+```sh
+sudo gpasswd -d "$USER" input
+# log out and back in for the change to take effect
+```
+
+You almost certainly want to keep `input` membership — losing it
+breaks Wayland input handling for every other tool you use — but it
+is your call, and the choice should be yours, not the plugin's.
+
 ## Usage
 
 1. Open Omalaunch.
@@ -190,16 +213,25 @@ new pop-up instead of a refreshed one.
 ## Known limitations
 
 - **Apple SPI keyboards, trackpads, and internal keyboards.** The
-  classifier uses a heuristic on `EV_*` masks and `KEY_*` bit counts; it
-  works on every Mac and PC keyboard, trackpad, mouse, drawing tablet,
-  and touchscreen we have tried. If a vendor ships a device with an
-  exotic descriptor the heuristic may classify it as `skip` and the
-  device will keep delivering events while the rest are blocked.
+  classifier uses a heuristic on `EV_*` masks and the set-bit count of
+  the `KEY_*` bitmap; it works on every Mac and PC keyboard,
+  trackpad, mouse, drawing tablet, and touchscreen we have tried. If
+  a vendor ships a device with an exotic descriptor the heuristic
+  may classify it as `skip` and the device will keep delivering
+  events while the rest are blocked.
 - **Power button, lid switch, headphone-jack buttons.** These are
   intentionally not grabbed. Grabbing them would block system events
   you still want (suspend, audio). If you specifically want to clean
   near those, prefer `input` group membership plus a wipe during the
   timer rather than blocking them.
+- **Partial grab = no wipe.** If any classified device (a keyboard
+  the heuristic agreed was a keyboard, or a pointer the heuristic
+  agreed was a pointer) refuses `EVIOCGRAB` after a sibling device
+  has already been grabbed, the helper releases every grabbed fd
+  before sending an `urgency=critical` "Refusing to start — do NOT
+  wipe" notification. The cleaning window never opens. Retry by
+  closing whatever holds the fd (rare in practice; usually a
+  compositor-level grab or a stale process from a previous run).
 - **No early abort.** There is no signal path to release early from
   the launcher. The shortest available duration is 15 s — wait it out,
   log out, or restart. The kernel releases the grabs automatically on
@@ -216,6 +248,20 @@ new pop-up instead of a refreshed one.
   one to finish, or release it manually by killing the running
   process.
 
+## Tests
+
+```sh
+python3 tests/test_devices.py
+```
+
+Sixteen focused tests, stdlib only. They lock in the parser
+contract (Apple SMC power/lid -> bit 116, BTN_LEFT -> bit 272 for
+trackpads and mice, real keyboard popcount window), the classifier
+contract (power button, lid switch, headset volume, headphone jack
+all `skip`; real keyboard, trackpad, USB mouse all detected), and
+the partial-failure contract (4-tuple return, `classified_keyboards`
+exposed for `main()` to refuse unsafe half-grabs).
+
 ## Files
 
 ```
@@ -226,6 +272,8 @@ bin/keyboard-cleaner.py
                       drives the per-second popup refresh, releases on
                       exit/signal
 manifest.json         Omarchy plugin manifest (kinds: extension)
+tests/test_devices.py 16 stdlib-only tests for parser, classifier,
+                      and partial-failure contract
 CHANGELOG.md          version history
 LICENSE               MIT license
 ```

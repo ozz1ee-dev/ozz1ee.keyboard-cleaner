@@ -18,6 +18,7 @@ import contextlib
 import errno
 import fcntl
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -39,12 +40,24 @@ EV_REP = 0x14
 EV_FF = 0x15
 EV_PWR = 0x16
 
-# KEY bit positions (input-event-codes.h). We use them only to tell whether
-# a device actually carries keyboard letters rather than a single button.
-KEY_Q = 16
-KEY_LEFTCTRL = 29
-KEY_LEFTALT = 56
-KEY_KPENTER = 96
+# KEY bit positions (input-event-codes.h) are not referenced by name any
+# more: the classifier counts set bits rather than probing individual
+# positions (see `categorize()` below). Constants are kept off this list
+# on purpose — adding them back invites future bugs like the
+# `key >> KEY_KPENTER and key >> KEY_KPENTER` check that mistook the
+# Apple SMC power/lid device for a keyboard in v0.2.0.
+
+# A real keyboard lights up dozens of KEY bits across the letter, modifier,
+# function-key, and keypad ranges. Single-button devices (power button, lid
+# switch, headphone jack, headset volume keys) usually expose one or two
+# bits. The threshold below sits between those two populations so the
+# classifier can distinguish them without enumerating every keycode.
+#
+# 8 bits is conservative: a power button exposes exactly 1 (KEY_POWER=116),
+# a headset volume rocker exposes 2-3 (KEY_VOLUMEUP=115, KEY_VOLUMEDOWN=114,
+# KEY_MUTE=113), and even a tiny keypad-only device exposes at least the
+# keypad arrows + digits (>=10 bits). Real keyboards expose 100+ bits.
+MIN_KEYBOARD_KEY_POPCOUNT = 8
 
 INPUT_DEVICES_PATH = Path("/proc/bus/input/devices")
 INPUT_EVENT_ROOT = Path("/dev/input")
@@ -64,37 +77,85 @@ OMARCHY_NOTIFY = Path("/usr/share/omarchy/bin/omarchy-notification-send")
 OMARCHY_NOTIFY_AVAILABLE = OMARCHY_NOTIFY.is_file()
 
 
-def parse_input_devices() -> list[dict[str, object]]:
+def parse_keyword(tokens: list[str]) -> int:
+    """Combine the whitespace-separated hex tokens of a `B: KEY=...` line
+    from /proc/bus/input/devices into a single bitmap integer.
+
+    The kernel prints one `unsigned long` per token, MSB-first, omitting
+    leading zeros. On aarch64 / x86_64 that is 64 bits per token; on 32-bit
+    platforms it would be 32 bits per token. The number of tokens depends
+    on `KEY_MAX` (kernel build configuration) so we count tokens rather
+    than assuming a fixed length.
+
+    The earlier implementation assumed 32-bit tokens in LSB order; that
+    matched the dump on x86 boxes but produced a wrong bitmap on aarch64
+    where the kernel prints 64-bit tokens MSB-first. Concretely, on the
+    Apple SMC power/lid device the buggy parser set bit 52 instead of
+    bit 116 (KEY_POWER), and the classifier then mistook the power
+    button for a keyboard.
+
+    See drivers/input/input.c:input_seq_print_bitmap() for the matching
+    kernel-side printer.
+    """
+    unsigned_long_bits = 8 * 8  # 64 bits on every platform we target.
+    bits = 0
+    for index, token in enumerate(tokens):
+        with contextlib.suppress(ValueError):
+            value = int(token, 16)
+            # Token 0 is the most-significant chunk; shift it down by N
+            # unsigned longs so it lands at the top of the bitmap.
+            shift = (len(tokens) - 1 - index) * unsigned_long_bits
+            bits |= value << shift
+    return bits
+
+
+def parse_input_devices(source=None) -> list[dict[str, object]]:
     """Read /proc/bus/input/devices into a structured list.
 
     Returns one entry per device with the values we care about: a human
-    name, the eventX handler, and the populated bitset columns.
+    name, the eventX handler, and the populated bitset columns. Pass a
+    string `source` to override the default file read; the tests use
+    that to feed captured dumps without touching the live proc file.
     """
-    try:
-        raw = INPUT_DEVICES_PATH.read_text(encoding="utf-8", errors="replace")
-    except FileNotFoundError:
-        return []
+    if source is None:
+        try:
+            source = INPUT_DEVICES_PATH.read_text(encoding="utf-8", errors="replace")
+        except FileNotFoundError:
+            return []
 
     entries: list[dict[str, object]] = []
     current: dict[str, object] = {}
 
-    for line in raw.splitlines():
+    for line in source.splitlines():
         if line.startswith("N:"):
-            current["name"] = line.split(":", 1)[1].strip().strip('"')
+            # The name field is quoted: `N: Name="Apple SPI Keyboard"`. A
+            # naive `.strip('"')` only strips outer quotes when the string
+            # itself starts with `"`, but after `line.split(":", 1)[1]` the
+            # remainder begins with ` Name=` so the leading character is
+            # space. We use a regex to grab the first quoted run.
+            match = re.search(r'"([^"]*)"', line)
+            if match:
+                current["name"] = match.group(1)
         elif line.startswith("H:"):
+            # Each token after `H: Handlers=` may look like `kbd`, `event3`,
+            # `mouse0`, `leds`. On multi-handler devices the line is
+            # `Handlers=kbd event0 leds`; on single-handler devices it is
+            # `Handlers=event3`. We accept both shapes by splitting each
+            # space-separated token on `=` (so `Handlers=event3` yields
+            # `event3`) and matching the `event<digit>` form with a regex.
             for handler in line.split(":", 1)[1].split():
-                if handler.startswith("event"):
-                    current["event"] = handler
+                for token in handler.split("="):
+                    if re.match(r"event\d+$", token):
+                        current["event"] = token
+                        break
+                else:
+                    continue
+                break
         elif line.startswith("B: EV="):
             with contextlib.suppress(ValueError):
                 current["ev"] = int(line.split("=", 1)[1].strip(), 16)
         elif line.startswith("B: KEY="):
-            parts = line.split("=", 1)[1].split()
-            bits = 0
-            for index, part in enumerate(parts):
-                with contextlib.suppress(ValueError):
-                    bits |= int(part, 16) << (index * 32)
-            current["key"] = bits
+            current["key"] = parse_keyword(line.split("=", 1)[1].split())
         elif line.strip() == "":
             if current.get("event"):
                 entries.append(current)
@@ -112,9 +173,18 @@ def categorize(device: dict[str, object]) -> str:
     Heuristic:
     - Anything that reports relative or absolute axes is treated as a
       pointing device (mouse, trackpad, drawing tablet, touchscreen).
-    - Devices with EV_KEY and many KEY bits are real keyboards.
-    - Devices with EV_KEY and very few KEY bits are buttons (power, lid,
-      headphone-jack), which we leave untouched.
+    - Devices with EV_KEY and many KEY bits set are real keyboards.
+      Single-bit devices (power button, lid switch) and few-bit
+      devices (headset volume rocker, headphone jack buttons) are
+      skipped on purpose — grabbing them would silence system events
+      the user still wants.
+    - Anything else is skipped.
+
+    The classifier counts set bits in the KEY bitmap rather than
+    testing specific keycode positions, because keycode positions
+    above 96 (KEY_KPENTER) also include power button (116), volume
+    keys (113-115), and other system controls. A presence check
+    against a single high position misclassifies those as keyboards.
     """
     ev = int(device.get("ev", 0))
     key = int(device.get("key", 0))
@@ -125,29 +195,36 @@ def categorize(device: dict[str, object]) -> str:
     if has_rel or has_abs:
         return "pointer"
 
-    if has_key_event:
-        # Keyboard keys span most of the KEY bitset. A power-button or
-        # lid-switch entry usually has only one bit set.
-        if key & ((1 << KEY_LEFTCTRL) - 1):
-            return "keyboard"
-        if key >> KEY_LEFTCTRL and key >> KEY_KPENTER:
-            return "keyboard"
-        if key & ((1 << KEY_Q) - 1):
-            return "keyboard"
-        return "skip"
+    if has_key_event and bin(key).count("1") >= MIN_KEYBOARD_KEY_POPCOUNT:
+        return "keyboard"
 
     return "skip"
 
 
-def grab_devices(categories: set[str]) -> tuple[list[tuple[int, str, str]], list[tuple[str, str, str]]]:
+def grab_devices(categories: set[str]) -> tuple[list[tuple[int, str, str]],
+                                              list[tuple[str, str, str]],
+                                              list[dict[str, object]],
+                                              list[dict[str, object]]]:
     """Open every matching device and try to EVIOCGRAB it.
 
-    Returns a tuple `(grabbed, skipped)` where `grabbed` carries the live
-    file descriptors and `skipped` records reasons so the helper can
-    explain why a particular device wasn't blocked.
+    Returns a 4-tuple `(grabbed, skipped, classified_keyboards,
+    classified_pointers)`:
+
+    - `grabbed` carries the live file descriptors of devices we
+      successfully grabbed.
+    - `skipped` records reasons for devices we wanted to grab but
+      could not (open() failed, EVIOCGRAB refused).
+    - `classified_keyboards` lists every device the classifier said
+      was a keyboard, regardless of whether we managed to grab it.
+      `main()` uses this to refuse the cleaning window when a
+      classified keyboard ended up in `skipped` — a half-grabbed
+      keyboard is a safety regression, not a partial success.
+    - `classified_pointers` is the equivalent for pointing devices.
     """
     grabbed: list[tuple[int, str, str]] = []
     skipped: list[tuple[str, str, str]] = []
+    classified_keyboards: list[dict[str, object]] = []
+    classified_pointers: list[dict[str, object]] = []
     seen: set[str] = set()
 
     for device in parse_input_devices():
@@ -160,6 +237,11 @@ def grab_devices(categories: set[str]) -> tuple[list[tuple[int, str, str]], list
         category = categorize(device)
         if category not in categories:
             continue
+
+        if category == "keyboard":
+            classified_keyboards.append(device)
+        else:
+            classified_pointers.append(device)
 
         path = INPUT_EVENT_ROOT / event
         try:
@@ -177,7 +259,51 @@ def grab_devices(categories: set[str]) -> tuple[list[tuple[int, str, str]], list
 
         grabbed.append((fd, str(path), name))
 
-    return grabbed, skipped
+    return grabbed, skipped, classified_keyboards, classified_pointers
+
+
+def grab_devices_for_test(devices: list[dict[str, object]],
+                          categories: set[str]
+                          ) -> tuple[list[tuple[int, str, str]],
+                                     list[tuple[str, str, str]],
+                                     list[dict[str, object]],
+                                     list[dict[str, object]]]:
+    """Test-only entry point: run the grab loop against a pre-parsed
+    device list. Mirrors `grab_devices` exactly except for the input
+    source, which lets the tests inject synthetic event paths without
+    touching /proc or /dev."""
+    grabbed: list[tuple[int, str, str]] = []
+    skipped: list[tuple[str, str, str]] = []
+    classified_keyboards: list[dict[str, object]] = []
+    classified_pointers: list[dict[str, object]] = []
+
+    for device in devices:
+        event = device.get("event")
+        name = str(device.get("name", "unknown device"))
+        if not isinstance(event, str):
+            continue
+        category = categorize(device)
+        if category not in categories:
+            continue
+        if category == "keyboard":
+            classified_keyboards.append(device)
+        else:
+            classified_pointers.append(device)
+        path = INPUT_EVENT_ROOT / event
+        try:
+            fd = os.open(str(path), os.O_RDWR | os.O_NONBLOCK)
+        except OSError as error:
+            skipped.append((name, str(path), error.strerror or str(error)))
+            continue
+        try:
+            fcntl.ioctl(fd, EVIOCGRAB, 1)
+        except OSError as error:
+            os.close(fd)
+            skipped.append((name, str(path), error.strerror or str(error)))
+            continue
+        grabbed.append((fd, str(path), name))
+
+    return grabbed, skipped, classified_keyboards, classified_pointers
 
 
 def release_devices(grabbed: list[tuple[int, str, str]]) -> None:
@@ -273,28 +399,58 @@ def main(argv: list[str]) -> int:
 
     print(f"Blocking keyboard and pointer devices for {duration} second(s).")
 
-    grabbed, skipped = grab_devices(categories)
+    grabbed, skipped, classified_keyboards, classified_pointers = (
+        grab_devices(categories)
+    )
 
-    if not grabbed:
+    # Partial-failure safety: if any device we wanted to block ended up in
+    # `skipped` we must NOT show the user the "wipe safely" pop-up. The
+    # remaining grabbed devices are released before we surface the error,
+    # so a partial grab never leaves the user with a half-blocked input
+    # device (which would either silently drop keystrokes or, worse,
+    # block a keyboard partially while leaving the lid-switch button
+    # exposed).
+    if skipped:
+        release_devices(grabbed)
         if not has_input_group():
             notify(
-                urgency="normal",
+                urgency="critical",
                 body=(
                     "Could not grab any input devices: your user is not in the "
                     "'input' group. Run `sudo usermod -aG input $USER` and log out."
                 ),
             )
-        elif skipped:
-            reasons = "; ".join(f"{name}: {reason}" for name, _, reason in skipped)
-            notify(
-                urgency="normal",
-                body=f"All input devices refused EVIOCGRAB ({reasons}).",
-            )
         else:
-            notify(
-                urgency="normal",
-                body="No input devices could be grabbed. Check /dev/input/event* access.",
-            )
+            missing_keyboards = [
+                d.get("name", "unknown") for d in classified_keyboards
+                if any(d.get("name") == name for name, _, _ in skipped)
+            ]
+            missing_pointers = [
+                d.get("name", "unknown") for d in classified_pointers
+                if any(d.get("name") == name for name, _, _ in skipped)
+            ]
+            reasons = "; ".join(f"{name}: {reason}" for name, _, reason in skipped)
+            if missing_keyboards or missing_pointers:
+                missing = ", ".join(missing_keyboards + missing_pointers)
+                notify(
+                    urgency="critical",
+                    body=(
+                        f"Refusing to start: {missing} could not be grabbed "
+                        f"({reasons}). Cleaning cancelled — do NOT wipe."
+                    ),
+                )
+            else:
+                notify(
+                    urgency="normal",
+                    body=f"Some input devices refused EVIOCGRAB ({reasons}).",
+                )
+        return 1
+
+    if not grabbed:
+        notify(
+            urgency="normal",
+            body="No input devices could be grabbed. Check /dev/input/event* access.",
+        )
         return 1
 
     device_rows: list[tuple[str, str]] = []
