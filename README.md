@@ -124,10 +124,11 @@ Removing the plugin removes every byte it ever wrote.
 ### `input` group membership is not removed by `omarchy plugin remove`
 
 `/dev/input/event*` is owned by the `input` group so the kernel can hand
-keystrokes to anything in that group. Membership in `input` is broader
-than this plugin: every desktop environment that intercepts input
-events — Wayland compositors, screen recorders, macro tools, gesture
-daemons — relies on it.
+keystrokes to anything in that group. This is broader than this plugin:
+screen recorders, macro tools, and gesture daemons may also rely on it.
+
+Hyprland receives devices through logind/libseat and does **not** need
+the `input` group — Omarchy runs fine without it.
 
 `omarchy plugin remove ozz1ee.keyboard-cleaner` deletes the plugin
 directory and clears its enablement, but it does **not** touch group
@@ -140,9 +141,10 @@ sudo gpasswd -d "$USER" input
 # log out and back in for the change to take effect
 ```
 
-You almost certainly want to keep `input` membership — losing it
-breaks Wayland input handling for every other tool you use — but it
-is your call, and the choice should be yours, not the plugin's.
+You may want to keep `input` membership if you use other tools that
+need direct access to input devices (screen recorders, macro tools,
+etc.), but it is your call — and the choice should be yours, not the
+plugin's. Removing the group does not break Hyprland or Wayland.
 
 ## Usage
 
