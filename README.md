@@ -57,7 +57,7 @@ repository into `~/.config/omarchy/plugins/` and enables the plugin in
 one step:
 
 ```sh
-omarchy plugin add https://github.com/radiohost-cloud/ozz1ee.keyboard-cleaner --enable
+omarchy plugin add https://github.com/ozz1ee-dev/ozz1ee.keyboard-cleaner --enable
 ```
 
 After the plugin is on disk, you can validate it from the plugin
@@ -74,7 +74,7 @@ If you want to install from a local checkout instead of a git URL, copy
 the directory into the user-local plugin root Omarchy watches:
 
 ```sh
-git clone https://github.com/radiohost-cloud/ozz1ee.keyboard-cleaner
+git clone https://github.com/ozz1ee-dev/ozz1ee.keyboard-cleaner
 cp -r ozz1ee.keyboard-cleaner ~/.config/omarchy/plugins/
 omarchy plugin enable ozz1ee.keyboard-cleaner
 ```
